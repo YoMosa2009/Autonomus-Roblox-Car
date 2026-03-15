@@ -1,0 +1,1649 @@
+-- AUTONOMOUS VEHICLE CONTROLLER V4 - SECTOR AVOIDANCE (REVAMPED)
+-- Multi-stage threat assessment with predictive collision detection
+-- Intelligent sensor fusion for smooth, accurate autonomous driving
+--
+-- Changes applied (per your request):
+-- 1) Forward velocity sign fix (no abs on dot; clamp to >= 0)
+-- 2) Lead vehicle TTC improvement using lead distance delta (closing speed)
+-- 3) Heading hold now activates when avoidance completes (and after pedestrian clear)
+-- 4) Lane pressure now uses closest-distance-to-edge, not lane ray counts
+-- 5) Obstacle avoidance replaced with sector-based free-space selection (windowed beams + hysteresis latch)
+-- 6) Fusion updated so lane assist is guidance and cannot override avoidance in conflict cases
+-- 7) Straight vs curve tuning: adaptive lane smoothing and speed scaling based on yaw rate and lane demand
+-- 8) Added STEER_SIGN config for steering calibration (flip if avoidance turns the wrong way)
+--
+
+
+local RunService = game:GetService("RunService")
+local car = script.Parent
+
+-- =========================
+-- CONFIGURATION
+-- =========================
+local CONFIG = {
+	-- Steering calibration (flip if avoidance turns the wrong way)
+	STEER_SIGN = 1,
+
+	-- Visuals / debug
+	ENABLE_VISUALS = true,
+	DEBUG_PRINT = false, -- keep false for smoothness, turn true only when diagnosing
+
+	-- Lane sensors
+	LANE_RAY_LENGTH = 4.0,
+	LANE_DETECTION_RAYS = 35,
+	LANE_SCAN_HALF_ANGLE = 75,
+
+	-- Lane steering (lane assist is guidance)
+	COUNT_FORCE_FACTOR = 1.22,
+	COUNT_DEADZONE = 0.05,
+	COUNT_SMOOTH_ALPHA = 0.19,
+
+	IDEAL_LANE_DISTANCE = 7.5,
+	IDEAL_MIN = 5.0,
+	IDEAL_MAX = 11.5,
+	DISTANCE_GAIN = 3.5,
+
+	-- LIDAR (increases “bubble” detection range + coverage)
+	-- LIDAR (balanced, forward-focused)
+	LIDAR_RANGE = 55.0,
+	LIDAR_SPREAD_HALF_ANGLE = 48,
+	LIDAR_BEAM_COUNT = 27,  -- keep odd for a centered forward beam
+
+	-- Threat zones should not exceed LIDAR_RANGE, otherwise it overreacts to far context
+	THREAT_ZONE_CRITICAL = 16.0,
+	THREAT_ZONE_WARNING  = 28.0,
+	THREAT_ZONE_CAUTION  = 38.0,
+	THREAT_ZONE_MONITOR  = 50.0,
+
+	-- Time-to-collision thresholds (seconds). Larger values = earlier reaction at speed
+	TTC_CRITICAL = 1.4,
+	TTC_WARNING  = 3.0,
+	TTC_CAUTION  = 4.8,
+
+	-- Path envelope (studs). This is the “bubble width” through the road
+	PATH_WIDTH_CENTER = 2.8, -- tight corridor
+	PATH_WIDTH_FULL   = 6.8, -- full bubble envelope
+	PATH_FORWARD_MIN  = 2.2, -- ignore ultra-close noise, but still react early
+
+	-- Steering / speed
+	MAX_STEER_ANGLE = 45,
+	STEERING_RATE = 0.18,
+	STEERING_RATE_AVOID = 0.30, -- faster steering response during avoidance
+
+	NORMAL_SPEED = 25,
+	AVOID_SPEED_MIN = 12,
+
+	-- Straight vs curve tuning (more stable on highways, earlier slowdown on curves)
+	CURVE_YAWRATE_DEG = 16.0,
+	CURVE_STEER_DEG = 16.0,
+	CURVE_SPEED_REDUCTION = 0.45,
+
+	-- Lane keep noise control (higher = calmer on straight roads)
+	LANE_STEER_DEADZONE_STRAIGHT = 1.4,
+	LANE_STEER_DEADZONE_CURVE = 0.45,
+
+	-- Base fusion weights (mostly relevant at low threat)
+	FUSION_LANE_WEIGHT_BASE = 0.55,
+	FUSION_OBSTACLE_WEIGHT_BASE = 0.75,
+	FUSION_PRESSURE_WEIGHT = 0.35,
+
+	-- Heading hold
+	HEADING_HOLD_TIME = 3.5,
+	HEADING_KP = 0.94,
+	HEADING_KD = 0.12,
+	HEADING_MAX_CORR = 18,
+	HEADING_DECAY = true,
+}
+
+	-- Visuals
+-- =========================
+-- SEMANTIC DATABASE
+-- =========================
+local SEMANTICS = {
+	Prefixes = {
+		Road = "Road_",
+		Lane = "Road_Lanes",
+		Vehicle = "Vehicles_",
+		Pedestrian = "Pedestrian_",
+		Barrier = "Road_Barrier",
+		MiscLane = "Unknown_Lane",
+		Avoid = "Avoid",
+	},
+	MaxAncestorHops = 6,
+}
+
+-- =========================
+-- INTERNAL TUNING
+-- =========================
+local LANE_STEER_FILTER_ALPHA = 0.22
+local LANE_SIGN_FLIP_WINDOW = 0.40
+local LANE_SIGN_FLIP_DAMP = 0.60
+local LANE_OVERSTEER_SUB_MAX = 2.5
+
+local LANE_PRESSURE_GAIN = 2.2
+local LANE_PRESSURE_DECAY = 3.0
+local LANE_PRESSURE_STEER_MAX = 10.0
+local LANE_PRESSURE_RATE = 0.20
+
+-- NEW: lane pressure distance shaping
+local LANE_EDGE_NEAR = 0.9   -- closer than this means very near boundary
+local LANE_EDGE_FAR = 3.2    -- farther than this means safe, little pressure
+
+-- Avoidance tuning
+local AVOID_MIN_STEER = 8.0             -- Minimum avoidance steering
+local AVOID_MAX_STEER = 28.0            -- Maximum avoidance steering
+local AVOID_STEER_RATE = 0.20           -- Steering blend rate
+local AVOID_SESSION_COOLDOWN = 0.8      -- Cooldown between sessions
+local AVOID_CLEAR_THRESHOLD = 0.15      -- Threat score to exit avoidance
+
+local SPEED_STEER_SLOW = 0.45
+local SPEED_THREAT_MULT_CRITICAL = 0.50
+local SPEED_THREAT_MULT_WARNING = 0.70
+local SPEED_THREAT_MULT_CAUTION = 0.85
+
+local SPEED_ACCEL = 26.0
+local SPEED_DECEL = 60.0
+local SPEED_ACCEL_PED_POST = 12.0
+local PED_POST_AVOID_SLOW_TIME = 2.0
+
+local PED_STATIONARY_TIME = 2.0
+local PED_MOVE_DIST_RATE = 0.75
+local PED_MOVE_ANGLE_RATE = 10.0
+local PED_YIELD_DIST = 30.0
+local PED_AVOID_MAX_DIST = 38.0
+local PED_CLEAR_TIME = 0.35
+
+local PED_SECTOR_ANGLE_PENALTY = 0.55
+local PED_SECTOR_EDGE_PENALTY = 0.40
+local PED_AVOID_BASE_CAP = 6.0
+local PED_AVOID_MAX_CAP = 14.0
+local PED_AVOID_HIT_SCALE = 0.9
+local PED_AVOID_PRESSURE_SHRINK = 0.55
+local PED_AVOID_BLEND_ALPHA = 0.30
+
+-- NEW: lead TTC tuning
+local LEAD_TTC_MATCH_DIST = 3.0     -- how close a threat distance must be to leadDist to be treated as "the lead"
+local LEAD_CLOSING_EPS = 0.10       -- min closing speed threshold
+
+-- =========================
+-- FAST LOCALS
+-- =========================
+local math_abs = math.abs
+local math_atan2 = math.atan2
+local math_deg = math.deg
+local math_huge = math.huge
+local math_max = math.max
+local math_min = math.min
+local math_rad = math.rad
+local math_clamp = math.clamp
+local math_sqrt = math.sqrt
+
+-- =========================
+-- UTILITIES
+-- =========================
+local function clamp(v, a, b) return math_max(a, math_min(b, v)) end
+local function smoothLerp(cur, tgt, a) return cur + (tgt - cur) * a end
+local function now() return time() end
+local function sign(x)
+	if x > 0 then return 1
+	elseif x < 0 then return -1
+	else return 0 end
+end
+
+local function wrapDeg(a)
+	a = (a + 180) % 360
+	if a < 0 then a += 360 end
+	return a - 180
+end
+
+local function getYawDeg(cf: CFrame): number
+	local look = cf.LookVector
+	return math_deg(math_atan2(look.X, look.Z))
+end
+
+local function startsWith(s: string, prefix: string): boolean
+	return s:sub(1, #prefix) == prefix
+end
+
+local function safeDivide(numerator: number, denominator: number, default: number?): number
+	if denominator == 0 or denominator ~= denominator then
+		return default or 0
+	end
+	return numerator / denominator
+end
+
+local function ema(current: number, new: number, alpha: number): number
+	return current + (new - current) * clamp(alpha, 0, 1)
+end
+
+-- NEW: normalize lane edge proximity into [0..1] pressure
+local function edgePressureFromClosest(closestDist: number): number
+	if not closestDist or closestDist >= math_huge then
+		return 0
+	end
+	-- If closestDist <= near => 1, if >= far => 0
+	local u = 1 - clamp((closestDist - LANE_EDGE_NEAR) / (LANE_EDGE_FAR - LANE_EDGE_NEAR), 0, 1)
+	return u
+end
+
+-- =========================
+-- SEMANTIC CLASSIFIER
+-- =========================
+local Class = {
+	Unknown = 0,
+	Road = 1,
+	Lane = 2,
+	MiscLane = 3,
+	Vehicle = 4,
+	Pedestrian = 5,
+	Barrier = 6,
+	Avoid = 7,
+}
+
+local classCache = setmetatable({}, { __mode = "k" })
+
+local function classifyInstance(inst: Instance?): number
+	if not inst then return Class.Unknown end
+
+	local cached = classCache[inst]
+	if cached then return cached end
+
+	local pRoad = SEMANTICS.Prefixes.Road
+	local pLane = SEMANTICS.Prefixes.Lane
+	local pVeh = SEMANTICS.Prefixes.Vehicle
+	local pPed = SEMANTICS.Prefixes.Pedestrian
+	local pBar = SEMANTICS.Prefixes.Barrier
+	local pMisc = SEMANTICS.Prefixes.MiscLane
+	local pAvoid = SEMANTICS.Prefixes.Avoid
+
+	local cur: Instance? = inst
+	local hops = 0
+
+	while cur and hops <= SEMANTICS.MaxAncestorHops do
+		local n = cur.Name
+
+		if startsWith(n, pAvoid) then classCache[inst] = Class.Avoid; return Class.Avoid end
+		if startsWith(n, pVeh) then classCache[inst] = Class.Vehicle; return Class.Vehicle end
+		if startsWith(n, pPed) then classCache[inst] = Class.Pedestrian; return Class.Pedestrian end
+		if startsWith(n, pBar) then classCache[inst] = Class.Barrier; return Class.Barrier end
+		if startsWith(n, pLane) then classCache[inst] = Class.Lane; return Class.Lane end
+		if startsWith(n, pMisc) then classCache[inst] = Class.MiscLane; return Class.MiscLane end
+		if startsWith(n, pRoad) then classCache[inst] = Class.Road; return Class.Road end
+
+		cur = cur.Parent
+		hops += 1
+	end
+
+	classCache[inst] = Class.Unknown
+	return Class.Unknown
+end
+
+-- NOTE: unchanged (barriers still ignored by LIDAR as requested)
+local function isIgnorableForLidar(classId: number): boolean
+	if classId == Class.Road or classId == Class.Lane or classId == Class.MiscLane then
+		return true
+	end
+	if CONFIG.LIDAR_IGNORE_BARRIERS and classId == Class.Barrier then
+		return true
+	end
+	return false
+end
+
+local function isLaneMarkerClass(classId: number): boolean
+	return classId == Class.Lane or classId == Class.MiscLane
+end
+
+local function isDynamicActor(classId: number): boolean
+	return classId == Class.Vehicle or classId == Class.Pedestrian
+end
+
+local function isObstacleForSteering(classId: number): boolean
+	return classId == Class.Avoid or classId == Class.Vehicle or classId == Class.Pedestrian or classId == Class.Unknown
+end
+
+-- =========================
+-- COMPONENT INITIALIZATION
+-- =========================
+local steeringHinges = {}
+local leftMotors = {}
+local rightMotors = {}
+
+local sensorL = car:FindFirstChild("SensorL")
+local sensorR = car:FindFirstChild("SensorR")
+local sensorC = car:FindFirstChild("SensorC")
+
+if not (sensorL and sensorR and sensorC) then
+	warn("❌ [AutoDrive] Critical: Missing sensors")
+	return
+end
+
+for _, d in ipairs(car:GetDescendants()) do
+	if d:IsA("BasePart") then
+		d:SetNetworkOwner(nil)
+	end
+
+	if d.Name == "SteeringConstraint" then
+		d.ActuatorType = Enum.ActuatorType.Servo
+		d.AngularSpeed = 30
+		d.ServoMaxTorque = 1e9
+		table.insert(steeringHinges, d)
+	elseif d.Name == "WheelMotorL" then
+		d.ActuatorType = Enum.ActuatorType.Motor
+		d.MotorMaxTorque = 200000
+		table.insert(leftMotors, d)
+	elseif d.Name == "WheelMotorR" then
+		d.ActuatorType = Enum.ActuatorType.Motor
+		d.MotorMaxTorque = 200000
+		table.insert(rightMotors, d)
+	end
+end
+
+local headingPart: BasePart = (car.PrimaryPart and car.PrimaryPart:IsA("BasePart") and car.PrimaryPart) or sensorC
+local primary: BasePart = car.PrimaryPart or headingPart
+
+-- =========================
+-- THREAT LEVELS
+-- =========================
+local ThreatLevel = {
+	NONE = 0,
+	MONITOR = 1,    -- Tracking obstacle
+	CAUTION = 2,    -- Pre-emptive adjustment
+	WARNING = 3,    -- Active avoidance
+	CRITICAL = 4,   -- Emergency maneuver
+}
+
+local ThreatLevelNames = {
+	[0] = "NONE",
+	[1] = "MONITOR",
+	[2] = "CAUTION",
+	[3] = "WARNING",
+	[4] = "CRITICAL",
+}
+
+-- =========================
+-- VEHICLE STATE
+-- =========================
+local vehicle = {
+	currentSteer = 0,
+
+	-- Lane tracking
+	smoothedLeftCount = 0,
+	smoothedRightCount = 0,
+	prevLaneSteer = 0,
+	lastLaneSign = 0,
+	lastLaneFlipT = 0,
+
+	-- Pressure (edge detection)
+	leftPressure = 0,
+	rightPressure = 0,
+	pressureSteer = 0,
+
+	-- Threat tracking
+	maxThreatLevel = ThreatLevel.NONE,
+	threatScore = 0,
+	threatDistance = math_huge,
+	threatLateral = 0,
+	threatForward = 0,
+	avoidDirection = 0,
+	avoidSteer = 0,
+
+	-- New avoidance state (sector selection)
+	avoidTargetAngle = 0,
+	avoidTargetScore = -math_huge,
+	avoidTargetUntil = 0,
+	avoidBlocked = false,
+
+	-- Avoidance session
+	inAvoidance = false,
+	avoidCooldownUntil = 0,
+
+	-- Heading hold
+	headingHoldUntil = 0,
+	headingHoldYaw = 0,
+	prevYaw = 0,
+	prevYawValid = false,
+
+	-- Speed
+	speedCurrent = 0,
+	speedTarget = CONFIG.NORMAL_SPEED,
+	pedSlowUntil = 0,
+
+	-- Pedestrian tracking
+	pedSeen = false,
+	pedLastSeenT = -math_huge,
+	pedPrevDist = math_huge,
+	pedPrevAngle = 0,
+	pedPrevValid = false,
+	pedStationaryTime = 0,
+	pedAvoidActive = false,
+	pedAvoidSteer = 0,
+	pedPeakHits = 0,
+	pedSide = 0,
+
+	-- Performance
+	frameCount = 0,
+	avgFrameTime = 0,
+}
+
+-- =========================
+-- RAYCAST PARAMS
+-- =========================
+local laneRayParams = RaycastParams.new()
+laneRayParams.FilterDescendantsInstances = { car }
+laneRayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local obstacleRayParams = RaycastParams.new()
+do
+	local filter = { car }
+	local baseplate = workspace:FindFirstChild("Baseplate")
+	if baseplate then table.insert(filter, baseplate) end
+	obstacleRayParams.FilterDescendantsInstances = filter
+	obstacleRayParams.FilterType = Enum.RaycastFilterType.Exclude
+end
+
+-- =========================
+-- VISUAL MANAGEMENT
+-- =========================
+local function createVisual(length: number, thickness: number?)
+	if not CONFIG.ENABLE_VISUALS then return nil end
+
+	local p = Instance.new("Part")
+	p.Name = "VisualBeam"
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.CanTouch = false
+	p.Size = Vector3.new(thickness or 0.06, thickness or 0.06, math_max(length, 0.1))
+	p.Material = Enum.Material.Neon
+	p.Transparency = 0.45
+	p.Parent = workspace
+	return p
+end
+
+local function updateVisual(visual: Part?, startPos: Vector3, endPos: Vector3, color: Color3?)
+	if not visual then return end
+	visual.CFrame = CFrame.new(startPos:Lerp(endPos, 0.5), endPos)
+	if color then visual.Color = color end
+end
+
+-- =========================
+-- RAYCAST
+-- =========================
+local function raycastSkipClasses(origin: Vector3, dir: Vector3, params: RaycastParams, maxSkips: number)
+	local remaining = dir.Magnitude
+	if remaining <= 0 then return nil end
+
+	local unit = dir / remaining
+	local o = origin
+	local eps = 0.05
+
+	for _ = 1, maxSkips do
+		local result = workspace:Raycast(o, unit * remaining, params)
+		if not result or not result.Instance then return nil end
+
+		local classId = classifyInstance(result.Instance)
+		if not isIgnorableForLidar(classId) then
+			return result, classId
+		end
+
+		local hitDist = (result.Position - o).Magnitude
+		remaining -= hitDist
+		if remaining <= 0.1 then return nil end
+		o = result.Position + unit * eps
+	end
+
+	return nil
+end
+
+-- =========================
+-- LANE SENSOR
+-- =========================
+local LaneSensor = {}
+LaneSensor.__index = LaneSensor
+
+local function median4(a: number, b: number, c: number, d: number): number
+	if a > b then a, b = b, a end
+	if c > d then c, d = d, c end
+	if a > c then a, c = c, a end
+	if b > d then b, d = d, b end
+	if b > c then b, c = c, b end
+	return (b + c) * 0.5
+end
+
+function LaneSensor.new(part: BasePart)
+	local self = setmetatable({}, LaneSensor)
+	self.part = part
+	self.beams = {}
+
+	local rays = CONFIG.LANE_DETECTION_RAYS
+	local half = CONFIG.LANE_SCAN_HALF_ANGLE
+
+	for i = 1, rays do
+		local t = (i - 1) / math_max(rays - 1, 1)
+		local angle = -half + t * (half * 2)
+		local localVec = CFrame.Angles(0, math_rad(angle), 0) * Vector3.new(0, 0, -CONFIG.LANE_RAY_LENGTH)
+		self.beams[i] = {
+			angle = angle,
+			localVec = localVec,
+			h1 = math_huge,
+			h2 = math_huge,
+			h3 = math_huge,
+			h4 = math_huge,
+			valid = false,
+			dist = math_huge,
+			visual = createVisual(CONFIG.LANE_RAY_LENGTH, 0.06),
+		}
+	end
+
+	return self
+end
+
+local function laneHistPush(b, v)
+	b.h1, b.h2, b.h3, b.h4 = b.h2, b.h3, b.h4, v
+end
+
+function LaneSensor:scan()
+	if not self.part or not self.part.Parent then
+		return { count = 0, forwardAvg = math_huge, closest = math_huge, detected = false }
+	end
+
+	local pos = self.part.Position
+	local ori = self.part.CFrame
+
+	local count = 0
+	local sumForward = 0
+	local fcount = 0
+	local closest = math_huge
+
+	for i = 1, #self.beams do
+		local b = self.beams[i]
+		local worldDir = ori:VectorToWorldSpace(b.localVec + Vector3.new(0, -CONFIG.LANE_RAY_LENGTH * 0.35, 0))
+		local result = workspace:Raycast(pos, worldDir, laneRayParams)
+
+		local hitDist = math_huge
+		local ok = false
+
+		if result and result.Instance and result.Instance:IsA("BasePart") then
+			local classId = classifyInstance(result.Instance)
+			if isLaneMarkerClass(classId) then
+				hitDist = (result.Position - pos).Magnitude
+				ok = true
+			else
+				local c = result.Instance.Color
+				if c.R >= 0.8 and c.G >= 0.8 and c.B >= 0.8 then
+					hitDist = (result.Position - pos).Magnitude
+					ok = true
+				end
+			end
+		end
+
+		laneHistPush(b, ok and hitDist or math_huge)
+
+		local finiteCount = 0
+		if b.h1 < math_huge then finiteCount += 1 end
+		if b.h2 < math_huge then finiteCount += 1 end
+		if b.h3 < math_huge then finiteCount += 1 end
+		if b.h4 < math_huge then finiteCount += 1 end
+
+		if finiteCount >= 2 then
+			local d = median4(b.h1, b.h2, b.h3, b.h4)
+			b.valid = (d < math_huge)
+			b.dist = d
+		else
+			b.valid = false
+			b.dist = math_huge
+			b.classId = Class.Unknown
+		end
+
+		if b.valid then
+			count += 1
+			if math_abs(b.angle) < 30 then
+				sumForward += b.dist
+				fcount += 1
+			end
+			closest = math_min(closest, b.dist)
+		end
+
+		if b.visual then
+			local color = ok and Color3.new(0, 1, 1) or Color3.new(1, 0, 0)
+			local endPos = pos + worldDir
+			updateVisual(b.visual, pos, endPos, color)
+		end
+	end
+
+	local forwardAvg = (fcount > 0) and (sumForward / fcount) or math_huge
+	return { count = count, forwardAvg = forwardAvg, closest = closest, detected = count > 0 }
+end
+
+function LaneSensor:destroy()
+	for _, b in ipairs(self.beams) do
+		if b.visual then b.visual:Destroy() end
+	end
+end
+
+-- =========================
+-- ANALYTICAL LIDAR WITH MULTI-STAGE THREAT ASSESSMENT
+-- =========================
+local Lidar = {}
+Lidar.__index = Lidar
+
+function Lidar.new(part: BasePart)
+	local self = setmetatable({}, Lidar)
+	self.part = part
+	self.beams = {}
+
+	-- Lead vehicle tracking
+	self.leadDist = math_huge
+	self.leadValid = false
+	self.prevLeadDist = math_huge
+	self.leadClosingVel = 0 -- NEW
+
+	-- Pedestrian tracking
+	self.pedDist = math_huge
+	self.pedValid = false
+	self.pedHitCount = 0
+	self.pedAngleMean = 0
+	self.pedClosestAngle = 0
+	self.pedLastSeenT = -math_huge
+
+	-- Threat analysis
+	self.threats = {} -- Array of detected threats
+
+	local count = CONFIG.LIDAR_BEAM_COUNT
+	local half = CONFIG.LIDAR_SPREAD_HALF_ANGLE
+
+	for i = 1, count do
+		local t = (i - 1) / math_max(count - 1, 1)
+		local angle = -half + t * (half * 2)
+		local localVec = CFrame.Angles(0, math_rad(angle), 0) * Vector3.new(0, 0, -CONFIG.LIDAR_RANGE)
+		self.beams[i] = {
+			angle = angle,
+			localVec = localVec,
+			valid = false,
+			dist = math_huge,
+			visual = createVisual(CONFIG.LIDAR_RANGE, 0.12),
+		}
+	end
+
+	return self
+end
+
+local function threatLevelFrom(distance: number, ttc: number, lateral: number, forward: number)
+	-- Not ahead of us
+	if forward < CONFIG.PATH_FORWARD_MIN then
+		return ThreatLevel.NONE, 0
+	end
+
+	local lateralAbs = math_abs(lateral)
+	local inCenterPath = lateralAbs <= CONFIG.PATH_WIDTH_CENTER
+	local inFullPath = lateralAbs <= CONFIG.PATH_WIDTH_FULL
+
+	local level = ThreatLevel.NONE
+	local score = 0
+
+	if inCenterPath then
+		if distance <= CONFIG.THREAT_ZONE_CRITICAL or ttc <= CONFIG.TTC_CRITICAL then
+			level = ThreatLevel.CRITICAL
+			score = 1.0
+		elseif distance <= CONFIG.THREAT_ZONE_WARNING or ttc <= CONFIG.TTC_WARNING then
+			level = ThreatLevel.WARNING
+			score = 0.75
+		elseif distance <= CONFIG.THREAT_ZONE_CAUTION or ttc <= CONFIG.TTC_CAUTION then
+			level = ThreatLevel.CAUTION
+			score = 0.50
+		elseif distance <= CONFIG.THREAT_ZONE_MONITOR then
+			level = ThreatLevel.MONITOR
+			score = 0.25
+		end
+	elseif inFullPath then
+		if distance <= CONFIG.THREAT_ZONE_CRITICAL then
+			level = ThreatLevel.WARNING
+			score = 0.70
+		elseif distance <= CONFIG.THREAT_ZONE_WARNING then
+			level = ThreatLevel.CAUTION
+			score = 0.45
+		elseif distance <= CONFIG.THREAT_ZONE_CAUTION then
+			level = ThreatLevel.MONITOR
+			score = 0.25
+		end
+
+		local lateralFactor = (lateralAbs - CONFIG.PATH_WIDTH_CENTER) / (CONFIG.PATH_WIDTH_FULL - CONFIG.PATH_WIDTH_CENTER)
+		score = score * (1 - lateralFactor * 0.5)
+	end
+
+	return level, score
+end
+
+-- Threat analysis
+local function analyzeThreat(localPos: Vector3, distance: number, velocity: number, classId: number)
+	local lateral = localPos.X
+	local forward = -localPos.Z
+
+	-- Determine TTC using provided velocity
+	local ttc = math_huge
+	if velocity > 0.1 then
+		ttc = distance / velocity
+	end
+
+	local level, score = threatLevelFrom(distance, ttc, lateral, forward)
+
+	return {
+		isValid = level > ThreatLevel.NONE,
+		level = level,
+		score = score,
+		distance = distance,
+		lateral = lateral,
+		forward = forward,
+		ttc = ttc,
+		classId = classId,
+	}
+end
+
+function Lidar:scan(dt: number)
+	if not self.part or not self.part.Parent then
+		return self:getEmptyScan()
+	end
+
+	local pos = self.part.Position
+	local ori = self.part.CFrame
+
+	-- NEW: forward velocity sign fix (no abs)
+	local v = primary.AssemblyLinearVelocity
+	local lv = ori.LookVector
+	local forwardVelSigned = (v.X * lv.X) + (v.Z * lv.Z)
+	local forwardVel = math_max(0, forwardVelSigned)
+
+	-- Preserve previous lead distance for closing speed estimate
+	local prevLead = self.leadDist
+	self.prevLeadDist = prevLead
+
+	-- Reset threat tracking
+	self.threats = {}
+
+	local pedCount = 0
+	local pedAngleSum = 0
+	local pedClosestAngle = 0
+	local pedBestDist = math_huge
+	local pedFound = false
+
+	local bestLeadDist = math_huge
+	local bestLeadFound = false
+
+	for i = 1, #self.beams do
+		local b = self.beams[i]
+		local worldDir = ori:VectorToWorldSpace(b.localVec)
+		local hit, classId = raycastSkipClasses(pos, worldDir, obstacleRayParams, 5)
+
+		if hit and hit.Instance then
+			local d = (hit.Position - pos).Magnitude
+			b.valid = true
+			b.dist = d
+			b.classId = classId
+
+			local localP = ori:PointToObjectSpace(hit.Position)
+
+			-- Analyze this detection
+			if isObstacleForSteering(classId) then
+				local threat = analyzeThreat(localP, d, forwardVel, classId)
+				if threat.isValid then
+					table.insert(self.threats, threat)
+				end
+			end
+
+			-- Track pedestrians separately
+			if classId == Class.Pedestrian then
+				local forward = -localP.Z
+				if forward > CONFIG.PATH_FORWARD_MIN and math_abs(localP.X) <= CONFIG.PATH_WIDTH_FULL then
+					pedCount += 1
+					pedAngleSum += b.angle
+					if d < pedBestDist then
+						pedBestDist = d
+						pedClosestAngle = b.angle
+						pedFound = true
+					end
+				end
+			end
+
+			-- Track lead vehicle (dynamic actors excluding pedestrians)
+			if isDynamicActor(classId) and classId ~= Class.Pedestrian then
+				local forward = -localP.Z
+				if forward > CONFIG.PATH_FORWARD_MIN and math_abs(localP.X) <= CONFIG.PATH_WIDTH_FULL then
+					if d < bestLeadDist then
+						bestLeadDist = d
+						bestLeadFound = true
+					end
+				end
+			end
+
+			-- Visual feedback
+			if b.visual then
+				local color
+				if d <= CONFIG.THREAT_ZONE_CRITICAL then
+					color = Color3.new(1, 0, 0)
+				elseif d <= CONFIG.THREAT_ZONE_WARNING then
+					color = Color3.new(1, 0.5, 0)
+				elseif d <= CONFIG.THREAT_ZONE_CAUTION then
+					color = Color3.new(1, 1, 0)
+				else
+					color = Color3.new(0, 1, 0)
+				end
+				local endPos = pos + ori:VectorToWorldSpace(b.localVec)
+				updateVisual(b.visual, pos, endPos, color)
+			end
+		else
+			b.valid = false
+			b.dist = math_huge
+
+			if b.visual then
+				local endPos = pos + ori:VectorToWorldSpace(b.localVec)
+				updateVisual(b.visual, pos, endPos, Color3.new(0, 0.5, 1))
+			end
+		end
+	end
+
+	-- Update lead tracking
+	if bestLeadFound then
+		self.leadDist = bestLeadDist
+		self.leadValid = true
+	else
+		self.leadValid = false
+		self.leadDist = math_huge
+	end
+
+	-- NEW: lead closing speed (distance delta / dt)
+	local closingVel = 0
+	if dt and dt > 0 and self.leadValid and prevLead < math_huge and self.leadDist < math_huge then
+		closingVel = (prevLead - self.leadDist) / dt
+		if closingVel < 0 then closingVel = 0 end
+	end
+	self.leadClosingVel = closingVel
+
+	-- NEW: refine TTC for the lead vehicle threat using closing speed
+	if self.leadValid and self.leadClosingVel > LEAD_CLOSING_EPS then
+		for _, threat in ipairs(self.threats) do
+			if threat.classId == Class.Vehicle then
+				if math_abs(threat.distance - self.leadDist) <= LEAD_TTC_MATCH_DIST then
+					local ttcLead = threat.distance / self.leadClosingVel
+					if ttcLead < threat.ttc then
+						threat.ttc = ttcLead
+						local level, score = threatLevelFrom(threat.distance, threat.ttc, threat.lateral, threat.forward)
+						threat.level = level
+						threat.score = score
+						threat.isValid = (level > ThreatLevel.NONE)
+					end
+				end
+			end
+		end
+	end
+
+	-- Process threats to find maximum
+	local maxThreatLevel = ThreatLevel.NONE
+	local maxThreatScore = 0
+	local threatDist = math_huge
+	local threatLat = 0
+	local threatFwd = 0
+
+	for _, threat in ipairs(self.threats) do
+		if threat.isValid and threat.score > maxThreatScore then
+			maxThreatScore = threat.score
+			maxThreatLevel = threat.level
+			threatDist = threat.distance
+			threatLat = threat.lateral
+			threatFwd = threat.forward
+		end
+	end
+
+	-- Update pedestrian tracking
+	self.pedHitCount = pedCount
+	self.pedValid = pedFound
+	self.pedDist = pedFound and pedBestDist or math_huge
+	if pedCount > 0 then
+		self.pedAngleMean = pedAngleSum / pedCount
+		self.pedClosestAngle = pedClosestAngle
+	end
+	if pedFound then
+		self.pedLastSeenT = now()
+	end
+
+	return {
+		-- Threat data
+		maxThreatLevel = maxThreatLevel,
+		maxThreatScore = maxThreatScore,
+		threatDistance = threatDist,
+		threatLateral = threatLat,
+		threatForward = threatFwd,
+		threatCount = #self.threats,
+
+		-- Lead vehicle
+		leadValid = self.leadValid,
+		leadDist = self.leadDist,
+		leadClosingVel = self.leadClosingVel, -- NEW
+
+		-- Pedestrian
+		pedValid = self.pedValid,
+		pedDist = self.pedDist,
+		pedHitCount = self.pedHitCount,
+		pedAngleMean = self.pedAngleMean,
+		pedClosestAngle = self.pedClosestAngle,
+		pedLastSeenAge = pedFound and 0 or (now() - self.pedLastSeenT),
+	}
+end
+
+function Lidar:getEmptyScan()
+	return {
+		maxThreatLevel = ThreatLevel.NONE,
+		maxThreatScore = 0,
+		threatDistance = math_huge,
+		threatLateral = 0,
+		threatForward = 0,
+		threatCount = 0,
+		leadValid = false,
+		leadDist = math_huge,
+		leadClosingVel = 0,
+		pedValid = false,
+		pedDist = math_huge,
+		pedHitCount = 0,
+		pedAngleMean = 0,
+		pedClosestAngle = 0,
+		pedLastSeenAge = 999,
+	}
+end
+
+function Lidar:destroy()
+	for _, b in ipairs(self.beams) do
+		if b.visual then b.visual:Destroy() end
+	end
+end
+
+-- =========================
+-- INSTANTIATE SENSORS
+-- =========================
+local leftSensor = LaneSensor.new(sensorL)
+local rightSensor = LaneSensor.new(sensorR)
+local lidar = Lidar.new(sensorC)
+
+-- =========================
+-- ACTUATION
+-- =========================
+local function applySteering(angle: number, rate: number?)
+	rate = rate or CONFIG.STEERING_RATE
+
+	local steerSign = CONFIG.STEER_SIGN or 1
+	local target = clamp(angle, -CONFIG.MAX_STEER_ANGLE, CONFIG.MAX_STEER_ANGLE) * steerSign
+
+	vehicle.currentSteer = smoothLerp(vehicle.currentSteer, target, rate)
+
+	for i = 1, #steeringHinges do
+		steeringHinges[i].TargetAngle = vehicle.currentSteer
+	end
+end
+
+local function applySpeedRaw(speed: number)
+	for i = 1, #leftMotors do leftMotors[i].AngularVelocity = speed end
+	for i = 1, #rightMotors do rightMotors[i].AngularVelocity = -speed end
+end
+
+local function applySpeedSmooth(targetSpeed: number, dt: number)
+	local accel = (now() < vehicle.pedSlowUntil) and SPEED_ACCEL_PED_POST or SPEED_ACCEL
+	local decel = SPEED_DECEL
+	local cur = vehicle.speedCurrent
+
+	if targetSpeed > cur then
+		cur = math_min(cur + accel * dt, targetSpeed)
+	else
+		cur = math_max(cur - decel * dt, targetSpeed)
+	end
+
+	vehicle.speedCurrent = cur
+	applySpeedRaw(cur)
+end
+
+-- =========================
+-- LANE LOGIC
+-- =========================
+-- CHANGED: pressure now uses closest distances instead of counts
+local function updateLanePressure(leftClosest: number, rightClosest: number, dt: number): number
+	local decay = math_max(0, 1 - (LANE_PRESSURE_DECAY * dt))
+	vehicle.leftPressure *= decay
+	vehicle.rightPressure *= decay
+
+	local pLeft = edgePressureFromClosest(leftClosest)
+	local pRight = edgePressureFromClosest(rightClosest)
+
+	vehicle.leftPressure = clamp(vehicle.leftPressure + pLeft * (LANE_PRESSURE_GAIN * dt), 0, 1)
+	vehicle.rightPressure = clamp(vehicle.rightPressure + pRight * (LANE_PRESSURE_GAIN * dt), 0, 1)
+
+	local target = (vehicle.leftPressure - vehicle.rightPressure) * LANE_PRESSURE_STEER_MAX
+	vehicle.pressureSteer = smoothLerp(vehicle.pressureSteer, target, LANE_PRESSURE_RATE)
+	return clamp(vehicle.pressureSteer, -LANE_PRESSURE_STEER_MAX, LANE_PRESSURE_STEER_MAX)
+end
+
+local function computeLaneSteer(leftScan, rightScan, curveFactor: number?): (number, number, number)
+	curveFactor = clamp(curveFactor or 0, 0, 1)
+
+	local maxRays = CONFIG.LANE_DETECTION_RAYS
+
+	vehicle.smoothedLeftCount = ema(vehicle.smoothedLeftCount, leftScan.count or 0, CONFIG.COUNT_SMOOTH_ALPHA)
+	vehicle.smoothedRightCount = ema(vehicle.smoothedRightCount, rightScan.count or 0, CONFIG.COUNT_SMOOTH_ALPHA)
+
+	local normLeft = safeDivide(vehicle.smoothedLeftCount, math_max(1, maxRays), 0)
+	local normRight = safeDivide(vehicle.smoothedRightCount, math_max(1, maxRays), 0)
+
+	-- On straighter roads, widen the deadzone to reduce jitter
+	local countDeadzone = CONFIG.COUNT_DEADZONE + ((1 - curveFactor) * 0.02)
+
+	local diff = (normLeft - normRight)
+	if math_abs(diff) < countDeadzone then diff = 0 end
+	local steerCount = diff * CONFIG.COUNT_FORCE_FACTOR * CONFIG.MAX_STEER_ANGLE
+
+	local leftD = (leftScan.forwardAvg and leftScan.forwardAvg < math_huge) and leftScan.forwardAvg or nil
+	local rightD = (rightScan.forwardAvg and rightScan.forwardAvg < math_huge) and rightScan.forwardAvg or nil
+
+	local ideal = CONFIG.IDEAL_LANE_DISTANCE
+	if leftD and rightD then
+		ideal = clamp((leftD + rightD) * 0.5, CONFIG.IDEAL_MIN, CONFIG.IDEAL_MAX)
+	end
+
+	local steerDist = 0
+	if leftD or rightD then
+		local leftErr = leftD and (ideal - leftD) or 0
+		local rightErr = rightD and (ideal - rightD) or 0
+		local denom = (normLeft + normRight)
+		if denom > 0 then
+			local positionError = ((leftErr * normLeft) - (rightErr * normRight)) / denom
+			steerDist = positionError * CONFIG.DISTANCE_GAIN
+		end
+	end
+
+	local raw = clamp(steerCount * 0.6 + steerDist * 0.9, -CONFIG.MAX_STEER_ANGLE, CONFIG.MAX_STEER_ANGLE)
+
+	-- Reduce oversteer when both lanes detected
+	local totalNorm = clamp(normLeft + normRight, 0, 1)
+	local subtract = clamp(totalNorm * LANE_OVERSTEER_SUB_MAX, 0, LANE_OVERSTEER_SUB_MAX)
+	if raw ~= 0 then
+		raw = raw - sign(raw) * subtract
+	end
+
+	-- More responsive on curves, more stable on straights
+	local alpha = clamp(LANE_STEER_FILTER_ALPHA + (curveFactor * 0.10), 0.14, 0.36)
+	local filtered = smoothLerp(vehicle.prevLaneSteer, raw, alpha)
+
+	-- Damp rapid direction changes
+	local s = sign(filtered)
+	if s ~= 0 and vehicle.lastLaneSign ~= 0 and s ~= vehicle.lastLaneSign then
+		local tt = now()
+		if (tt - vehicle.lastLaneFlipT) <= LANE_SIGN_FLIP_WINDOW then
+			filtered *= LANE_SIGN_FLIP_DAMP
+		end
+		vehicle.lastLaneFlipT = tt
+		vehicle.lastLaneSign = s
+	elseif s ~= 0 then
+		vehicle.lastLaneSign = s
+	end
+
+	-- Deadzone after filtering
+	local steerDeadzone = CONFIG.LANE_STEER_DEADZONE_STRAIGHT + ((CONFIG.LANE_STEER_DEADZONE_CURVE - CONFIG.LANE_STEER_DEADZONE_STRAIGHT) * curveFactor)
+	if math_abs(filtered) < steerDeadzone then
+		filtered = 0
+	end
+
+	vehicle.prevLaneSteer = filtered
+	return clamp(filtered, -CONFIG.MAX_STEER_ANGLE, CONFIG.MAX_STEER_ANGLE), normLeft, normRight
+end
+
+-- =========================
+-- INTELLIGENT SENSOR FUSION
+-- =========================
+local function computeAvoidanceSteer(lidarScan, laneSteer: number, pressureSteer: number, dt: number): number
+	-- Sector-based free-space selection using existing LIDAR raycasts.
+	-- This reduces "steer into obstacle" failures and avoids oscillation by latching a target during an avoidance session.
+
+	local tl = lidarScan.maxThreatLevel or ThreatLevel.NONE
+
+	-- If there is nothing to avoid and we are not in an avoidance session, decay to zero
+	if (lidarScan.threatCount or 0) == 0 and not vehicle.inAvoidance then
+		vehicle.avoidBlocked = false
+		vehicle.avoidSteer = smoothLerp(vehicle.avoidSteer, 0, 0.25)
+		return vehicle.avoidSteer
+	end
+
+	local half = CONFIG.LIDAR_SPREAD_HALF_ANGLE
+	local desiredSteer = clamp(laneSteer + pressureSteer, -CONFIG.MAX_STEER_ANGLE, CONFIG.MAX_STEER_ANGLE)
+	local desiredAngle = (desiredSteer / CONFIG.MAX_STEER_ANGLE) * half
+
+	-- Tie-break preference: steer away from the main lateral threat if possible
+	local preferSide = -sign(lidarScan.threatLateral or 0)
+	if preferSide == 0 then
+		if vehicle.leftPressure < vehicle.rightPressure then
+			preferSide = -1
+		elseif vehicle.rightPressure < vehicle.leftPressure then
+			preferSide = 1
+		else
+			preferSide = vehicle.avoidDirection ~= 0 and vehicle.avoidDirection or 1
+		end
+	end
+
+	local beams = lidar.beams
+	local n = #beams
+
+	-- corridor clearance using a small angular window (gives the vehicle "width")
+	local function clearanceAt(i: number): number
+		local minD = CONFIG.LIDAR_RANGE
+		for j = i - 1, i + 1 do
+			local k = j
+			if k < 1 then
+				k = 1
+			elseif k > n then
+				k = n
+			end
+			local b = beams[k]
+			local d = (b.valid and b.dist or CONFIG.LIDAR_RANGE)
+			if d < minD then
+				minD = d
+			end
+		end
+		return minD
+	end
+
+	local bestAngle = 0
+	local bestScore = -math_huge
+	local bestClear = 0
+
+	-- weights (keep small, they stack)
+	local edgePenaltyW = 0.9
+	local laneBiasW = 0.8
+	local centerBiasW = 0.6
+
+	-- minimum forward clearance to consider a direction "safe-ish"
+	local minClear = CONFIG.PATH_FORWARD_MIN + 3.0
+
+	for i = 1, n do
+		local b = beams[i]
+		local angle = b.angle or 0
+
+		local clear = clearanceAt(i)
+		clear = math_min(clear, CONFIG.LIDAR_RANGE)
+
+		local uClear = clear / CONFIG.LIDAR_RANGE
+		local score = uClear * 1.6
+
+		-- prefer forward directions
+		local angleNorm = math_abs(angle) / half
+		score += (1 - angleNorm) * centerBiasW
+
+		-- prefer staying close to lane guidance when it is safe
+		local laneNorm = 1 - (math_abs(angle - desiredAngle) / (half + 1e-6))
+		score += clamp(laneNorm, 0, 1) * laneBiasW
+
+		-- penalize steering into high pressure lane edges
+		if angle < 0 then
+			score -= vehicle.leftPressure * edgePenaltyW
+		else
+			score -= vehicle.rightPressure * edgePenaltyW
+		end
+
+		-- small preference away from the closest lateral threat
+		if sign(angle) == preferSide then
+			score += 0.05
+		end
+
+		-- hard penalty when too close along that direction
+		if clear < minClear then
+			local pen = (1 - clamp(clear / minClear, 0, 1))
+			score -= pen * 2.0
+		end
+
+		if score > bestScore then
+			bestScore = score
+			bestAngle = angle
+			bestClear = clear
+		end
+	end
+
+	local t = now()
+
+	-- Latch target during avoidance to prevent oscillation.
+	-- Only switch if meaningfully better.
+	local switchHyst = (tl >= ThreatLevel.WARNING) and 0.18 or 0.12
+	local holdTime = (tl >= ThreatLevel.WARNING) and 0.25 or 0.18
+
+	if vehicle.inAvoidance and t < vehicle.avoidTargetUntil then
+		if bestScore < (vehicle.avoidTargetScore + switchHyst) then
+			bestAngle = vehicle.avoidTargetAngle
+			bestScore = vehicle.avoidTargetScore
+		end
+	end
+
+	vehicle.avoidTargetAngle = bestAngle
+	vehicle.avoidTargetScore = bestScore
+	vehicle.avoidTargetUntil = vehicle.inAvoidance and (t + holdTime) or t
+
+	local targetSteer = clamp((bestAngle / half) * CONFIG.MAX_STEER_ANGLE, -AVOID_MAX_STEER, AVOID_MAX_STEER)
+
+	-- Ensure we apply a decisive steer during high threat to prevent "straight into it" behavior
+	if tl >= ThreatLevel.WARNING then
+		if math_abs(targetSteer) < AVOID_MIN_STEER then
+			targetSteer = preferSide * AVOID_MIN_STEER
+		end
+	end
+
+	vehicle.avoidDirection = sign(targetSteer)
+
+	-- If even the best direction is very short, treat it as blocked (speed controller will stop)
+	local clearCritical = CONFIG.PATH_FORWARD_MIN + 2.0
+	vehicle.avoidBlocked = (tl >= ThreatLevel.WARNING) and (bestClear < clearCritical)
+
+	local rate = AVOID_STEER_RATE
+	if tl >= ThreatLevel.WARNING then
+		rate = math_max(rate, 0.32)
+	end
+
+	vehicle.avoidSteer = smoothLerp(vehicle.avoidSteer, targetSteer, rate)
+	return vehicle.avoidSteer
+end
+
+local function fuseSensorInputs(laneSteer: number, pressureSteer: number, avoidSteer: number, threatLevel: number, laneConfidence: number?): number
+	laneConfidence = clamp(laneConfidence or 0, 0, 1)
+
+	-- Base weights
+	local laneWeight = CONFIG.FUSION_LANE_WEIGHT_BASE
+	local obstacleWeight = CONFIG.FUSION_OBSTACLE_WEIGHT_BASE
+	local pressureWeight = CONFIG.FUSION_PRESSURE_WEIGHT
+
+	-- Threat-based weight schedule (lane assist is guidance, obstacles dominate at high threat)
+	if threatLevel == ThreatLevel.CRITICAL then
+		laneWeight = 0.15
+		obstacleWeight = 1.0
+		pressureWeight = 0.35
+	elseif threatLevel == ThreatLevel.WARNING then
+		laneWeight = 0.30
+		obstacleWeight = 0.90
+		pressureWeight = 0.45
+	elseif threatLevel == ThreatLevel.CAUTION then
+		laneWeight = 0.60
+		obstacleWeight = 0.60
+		pressureWeight = 0.40
+	elseif threatLevel == ThreatLevel.MONITOR then
+		laneWeight = 0.85
+		obstacleWeight = 0.25
+		pressureWeight = 0.30
+	else
+		laneWeight = 1.0
+		obstacleWeight = 0.0
+		pressureWeight = 0.40
+	end
+
+	-- Lane confidence gating (weak lane detection should not fight anything)
+	laneWeight *= (0.35 + 0.65 * laneConfidence)
+
+	-- During an avoidance session, lane assist becomes soft guidance
+	if vehicle.inAvoidance then
+		laneWeight *= 0.45
+	end
+
+	-- If lane steer conflicts with avoidance steer, reduce lane influence to prevent "steer into obstacle"
+	if math_abs(avoidSteer) >= 6 and math_abs(laneSteer) >= 3 and sign(avoidSteer) ~= sign(laneSteer) then
+		laneWeight *= 0.25
+	end
+
+	-- Pressure steer is a safety guard, but it can conflict while squeezing through gaps
+	if math_abs(avoidSteer) >= 10 and math_abs(pressureSteer) >= 5 and sign(avoidSteer) ~= sign(pressureSteer) then
+		pressureWeight *= 0.55
+	end
+
+	local totalWeight = laneWeight + obstacleWeight + pressureWeight
+	if totalWeight <= 0 then
+		return 0
+	end
+
+	local fusedSteer = (
+		(laneSteer * laneWeight) +
+			(avoidSteer * obstacleWeight) +
+			(pressureSteer * pressureWeight)
+	) / totalWeight
+
+	return clamp(fusedSteer, -CONFIG.MAX_STEER_ANGLE, CONFIG.MAX_STEER_ANGLE)
+end
+-- =========================
+-- PEDESTRIAN LOGIC
+-- =========================
+local function updatePedestrianTracker(lidarScan, dt: number)
+	if lidarScan.pedValid and (lidarScan.pedDist or math_huge) < math_huge then
+		vehicle.pedSeen = true
+		vehicle.pedLastSeenT = now()
+
+		local d = lidarScan.pedDist
+		local a = lidarScan.pedClosestAngle or 0
+
+		local moving = false
+		if vehicle.pedPrevValid and dt > 0 then
+			local distRate = math_abs(d - vehicle.pedPrevDist) / dt
+			local angleRate = math_abs(wrapDeg(a - vehicle.pedPrevAngle)) / dt
+			if distRate >= PED_MOVE_DIST_RATE or angleRate >= PED_MOVE_ANGLE_RATE then
+				moving = true
+			end
+		end
+
+		vehicle.pedPrevDist = d
+		vehicle.pedPrevAngle = a
+		vehicle.pedPrevValid = true
+
+		if moving then
+			vehicle.pedStationaryTime = 0
+		else
+			vehicle.pedStationaryTime = math_min(vehicle.pedStationaryTime + dt, 10.0)
+		end
+
+		if d <= PED_YIELD_DIST and vehicle.pedStationaryTime < PED_STATIONARY_TIME then
+			return true, false -- yield
+		end
+
+		if d <= PED_AVOID_MAX_DIST and vehicle.pedStationaryTime >= PED_STATIONARY_TIME then
+			return false, true -- avoid
+		end
+
+		return false, false
+	end
+
+	vehicle.pedSeen = false
+	vehicle.pedPrevValid = false
+	vehicle.pedStationaryTime = 0
+	return false, false
+end
+
+local function pedIsClear(lidarScan): boolean
+	if vehicle.pedAvoidActive then
+		if (lidarScan.pedLastSeenAge or 999) >= PED_CLEAR_TIME then
+			return true
+		end
+	end
+	return false
+end
+
+local function updatePedAvoidSteer(lidarScan): number
+	local hits = lidarScan.pedHitCount or 0
+	vehicle.pedPeakHits = math_max(vehicle.pedPeakHits, hits)
+
+	local side = sign(lidarScan.pedAngleMean or 0)
+	if side == 0 then side = sign(lidarScan.pedClosestAngle or 0) end
+	if side ~= 0 then vehicle.pedSide = side end
+
+	local awayDir = -vehicle.pedSide
+	if awayDir == 0 then awayDir = 1 end
+
+	local hitNorm = clamp(hits / 10, 0, 1)
+	local edgeRisk = clamp((vehicle.leftPressure + vehicle.rightPressure) * 0.5, 0, 1)
+
+	local cap = PED_AVOID_BASE_CAP + (hitNorm * PED_AVOID_HIT_SCALE * (PED_AVOID_MAX_CAP - PED_AVOID_BASE_CAP))
+	cap = cap * (1 - edgeRisk * PED_AVOID_PRESSURE_SHRINK)
+	cap = clamp(cap, 3.0, PED_AVOID_MAX_CAP)
+
+	local magnitude = cap
+
+	local pressuredDir = 0
+	if vehicle.leftPressure > vehicle.rightPressure then pressuredDir = -1
+	elseif vehicle.rightPressure > vehicle.leftPressure then pressuredDir = 1 end
+	if pressuredDir ~= 0 and awayDir == pressuredDir then
+		magnitude *= (1 - PED_SECTOR_EDGE_PENALTY)
+	end
+
+	local target = awayDir * magnitude
+	vehicle.pedAvoidSteer = smoothLerp(vehicle.pedAvoidSteer, target, PED_AVOID_BLEND_ALPHA)
+	return vehicle.pedAvoidSteer
+end
+
+-- =========================
+-- SPEED CONTROL
+-- =========================
+local function computeTargetSpeed(lidarScan, threatLevel: number, curveFactor: number, predictedSteer: number): number
+	local baseSpeed = CONFIG.NORMAL_SPEED
+	curveFactor = clamp(curveFactor, 0, 1)
+
+	-- Threat-based speed scaling
+	if threatLevel == ThreatLevel.CRITICAL then
+		baseSpeed = baseSpeed * SPEED_THREAT_MULT_CRITICAL
+	elseif threatLevel == ThreatLevel.WARNING then
+		baseSpeed = baseSpeed * SPEED_THREAT_MULT_WARNING
+	elseif threatLevel == ThreatLevel.CAUTION then
+		baseSpeed = baseSpeed * SPEED_THREAT_MULT_CAUTION
+	end
+
+	-- Curve scaling (highway straightness stays fast, curves slow down)
+	baseSpeed = baseSpeed * (1 - (curveFactor * (CONFIG.CURVE_SPEED_REDUCTION or 0)))
+
+	-- Traffic following
+	if lidarScan.leadValid and (lidarScan.leadDist or math_huge) < CONFIG.THREAT_ZONE_MONITOR then
+		local desiredGap = 15.0
+		if (lidarScan.leadDist or math_huge) < desiredGap then
+			local u = clamp((lidarScan.leadDist or 0) / desiredGap, 0, 1)
+			baseSpeed = math_min(baseSpeed, CONFIG.NORMAL_SPEED * u)
+		end
+	end
+
+	-- If we are boxed in, stop rather than steering into something
+	if vehicle.avoidBlocked then
+		return 0
+	end
+
+	-- Keep a minimum speed in avoidance (unless blocked)
+	if vehicle.inAvoidance and baseSpeed > 0 then
+		baseSpeed = math_max(baseSpeed, CONFIG.AVOID_SPEED_MIN)
+	end
+
+	-- Reduce speed when steering heavily (use predicted steer, not last frame)
+	local steerRatio = math_abs(predictedSteer) / CONFIG.MAX_STEER_ANGLE
+	local steerPenalty = 1 - (steerRatio * SPEED_STEER_SLOW)
+
+	return baseSpeed * steerPenalty
+end
+-- =========================
+-- HEADING HOLD
+-- =========================
+local function armHeadingHold()
+	vehicle.headingHoldYaw = getYawDeg(headingPart.CFrame)
+	vehicle.headingHoldUntil = now() + CONFIG.HEADING_HOLD_TIME
+	vehicle.prevYawValid = false
+end
+
+local function headingHoldSteer(dt: number): number
+	if now() >= vehicle.headingHoldUntil then return 0 end
+
+	local yaw = getYawDeg(headingPart.CFrame)
+
+	local yawRate = 0
+	if vehicle.prevYawValid and dt > 0 then
+		yawRate = wrapDeg(yaw - vehicle.prevYaw) / dt
+	end
+	vehicle.prevYaw = yaw
+	vehicle.prevYawValid = true
+
+	local err = wrapDeg(vehicle.headingHoldYaw - yaw)
+	local steer = (CONFIG.HEADING_KP * err) + (CONFIG.HEADING_KD * (-yawRate))
+	steer = clamp(steer, -CONFIG.HEADING_MAX_CORR, CONFIG.HEADING_MAX_CORR)
+
+	if CONFIG.HEADING_DECAY then
+		local u = (vehicle.headingHoldUntil - now()) / CONFIG.HEADING_HOLD_TIME
+		steer *= clamp(u, 0, 1)
+	end
+
+	return steer
+end
+
+-- =========================
+-- MAIN LOOP
+-- =========================
+local heartbeatConnection
+local lastDebugPrint = 0
+
+heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+	local t = now()
+	vehicle.frameCount += 1
+	vehicle.avgFrameTime = ema(vehicle.avgFrameTime, dt, 0.1)
+
+	-- Scan all sensors
+	local lscan = leftSensor:scan()
+	local rscan = rightSensor:scan()
+	local lidarScan = lidar:scan(dt)
+
+	-- Straight vs curve detector (uses vehicle yaw rate)
+	local yawRateDeg = math_abs(math_deg(primary.AssemblyAngularVelocity.Y))
+	local curveFactor0 = clamp(yawRateDeg / (CONFIG.CURVE_YAWRATE_DEG or 18.0), 0, 1)
+	vehicle.yawRateDeg = yawRateDeg
+
+	-- Update threat tracking with smoothing
+	vehicle.maxThreatLevel = lidarScan.maxThreatLevel
+	vehicle.threatScore = ema(vehicle.threatScore, lidarScan.maxThreatScore, 0.3)
+	vehicle.threatDistance = lidarScan.threatDistance
+	vehicle.threatLateral = lidarScan.threatLateral
+	vehicle.threatForward = lidarScan.threatForward
+
+	-- Pedestrian tracking
+	local pedYield, pedAvoid = updatePedestrianTracker(lidarScan, dt)
+
+	-- Pedestrian yield (moving pedestrian)
+	if pedYield then
+		if CONFIG.DEBUG_PRINT and (t - lastDebugPrint) > 0.5 then
+			print("🚶 PED YIELD - Stopping for moving pedestrian")
+			lastDebugPrint = t
+		end
+
+		local laneSteer = select(1, computeLaneSteer(lscan, rscan, curveFactor0))
+		local pressureSteer = updateLanePressure(lscan.closest, rscan.closest, dt)
+		applySteering(laneSteer + pressureSteer, CONFIG.STEERING_RATE)
+		applySpeedSmooth(0, dt)
+		return
+	end
+
+	-- Pedestrian avoidance (stationary pedestrian)
+	if pedAvoid then
+		if not vehicle.pedAvoidActive then
+			vehicle.pedAvoidActive = true
+			vehicle.pedPeakHits = 0
+			vehicle.pedAvoidSteer = 0
+			vehicle.pedSide = 0
+			if CONFIG.DEBUG_PRINT then
+				print("🚶 PED AVOID - Avoiding stationary pedestrian")
+			end
+		end
+
+		local pedSteer = updatePedAvoidSteer(lidarScan)
+		local laneSteer = select(1, computeLaneSteer(lscan, rscan, curveFactor0))
+		local pressureSteer = updateLanePressure(lscan.closest, rscan.closest, dt)
+
+		local finalSteer = clamp(laneSteer + pressureSteer + pedSteer, -CONFIG.MAX_STEER_ANGLE, CONFIG.MAX_STEER_ANGLE)
+		applySteering(finalSteer, CONFIG.STEERING_RATE_AVOID)
+
+		local targetSpeed = CONFIG.NORMAL_SPEED * 0.6
+		applySpeedSmooth(targetSpeed, dt)
+		return
+	end
+
+	-- End pedestrian avoidance when clear
+	if vehicle.pedAvoidActive and pedIsClear(lidarScan) then
+		vehicle.pedAvoidActive = false
+		vehicle.pedSlowUntil = t + PED_POST_AVOID_SLOW_TIME
+		vehicle.pedAvoidSteer = 0
+		armHeadingHold() -- NEW: stabilize after pedestrian avoid
+		if CONFIG.DEBUG_PRINT then
+			print("✅ PED CLEAR")
+		end
+	end
+
+	-- Compute lane steering (lane assist is guidance; confidence gates its influence)
+	local laneSteer, normLeft, normRight = computeLaneSteer(lscan, rscan, curveFactor0)
+	local laneConfidence = clamp((normLeft + normRight) * 0.5, 0, 1)
+
+	-- Refine curve estimate using lane demand
+	local curveFactor = clamp(math_max(curveFactor0, math_abs(laneSteer) / (CONFIG.CURVE_STEER_DEG or 18.0)), 0, 1)
+
+	local pressureSteer = updateLanePressure(lscan.closest, rscan.closest, dt)
+
+	-- Compute avoidance steering
+	local avoidSteer = computeAvoidanceSteer(lidarScan, laneSteer, pressureSteer, dt)
+
+	-- Manage avoidance session
+	if not vehicle.inAvoidance and t >= vehicle.avoidCooldownUntil then
+		if vehicle.maxThreatLevel >= ThreatLevel.CAUTION then
+			vehicle.inAvoidance = true
+			if CONFIG.DEBUG_PRINT then
+				print(string.format("⚠️ AVOIDANCE START - Level: %s, Score: %.2f, Dist: %.1f, Lat: %.1f",
+					ThreatLevelNames[vehicle.maxThreatLevel], vehicle.threatScore, vehicle.threatDistance, vehicle.threatLateral))
+			end
+		end
+	end
+
+	if vehicle.inAvoidance then
+		if vehicle.threatScore < AVOID_CLEAR_THRESHOLD and vehicle.maxThreatLevel < ThreatLevel.CAUTION then
+			vehicle.inAvoidance = false
+			vehicle.avoidSteer = 0
+			vehicle.avoidDirection = 0
+			vehicle.avoidTargetAngle = 0
+			vehicle.avoidTargetScore = -math_huge
+			vehicle.avoidTargetUntil = 0
+			vehicle.avoidBlocked = false
+			vehicle.avoidCooldownUntil = t + AVOID_SESSION_COOLDOWN
+
+			armHeadingHold() -- NEW: heading hold activates on avoidance completion
+
+			if CONFIG.DEBUG_PRINT then
+				print("✅ AVOIDANCE COMPLETE")
+			end
+		end
+	end
+
+	-- Fuse all sensor inputs
+	local fusedSteer = fuseSensorInputs(laneSteer, pressureSteer, avoidSteer, vehicle.maxThreatLevel, laneConfidence)
+
+	-- Add heading hold correction if active
+	local headingCorr = headingHoldSteer(dt)
+	if headingCorr ~= 0 then
+		fusedSteer = clamp(fusedSteer + headingCorr, -CONFIG.MAX_STEER_ANGLE, CONFIG.MAX_STEER_ANGLE)
+	end
+
+	-- Apply steering
+	local steerRate = (vehicle.maxThreatLevel >= ThreatLevel.WARNING) and CONFIG.STEERING_RATE_AVOID or CONFIG.STEERING_RATE
+	applySteering(fusedSteer, steerRate)
+
+	-- Compute and apply speed
+	local targetSpeed = computeTargetSpeed(lidarScan, vehicle.maxThreatLevel, curveFactor, fusedSteer)
+	applySpeedSmooth(targetSpeed, dt)
+
+	-- Debug output
+	if CONFIG.DEBUG_PRINT and (t - lastDebugPrint) > 1.0 then
+		if vehicle.maxThreatLevel > ThreatLevel.NONE then
+			print(string.format("📊 Threat: %s (%.2f) | Dist: %.1f | Lead: %.1f (cv=%.2f) | Steer: L=%.1f A=%.1f P=%.1f F=%.1f",
+				ThreatLevelNames[vehicle.maxThreatLevel],
+				vehicle.threatScore,
+				vehicle.threatDistance,
+				(lidarScan.leadDist or math_huge),
+				(lidarScan.leadClosingVel or 0),
+				laneSteer,
+				avoidSteer,
+				pressureSteer,
+				fusedSteer))
+		end
+		lastDebugPrint = t
+	end
+end)
+
+-- =========================
+-- CLEANUP
+-- =========================
+script.AncestryChanged:Connect(function()
+	if not script:IsDescendantOf(game) then
+		if heartbeatConnection then heartbeatConnection:Disconnect() end
+		leftSensor:destroy()
+		rightSensor:destroy()
+		lidar:destroy()
+		print("🛑 [AutoDrive] Stopped")
+	end
+end)
+
+print("✅ [AutoDrive] Analytical Fusion Controller loaded (PATCHED)")
+print("   - Multi-stage threat assessment: ACTIVE")
+print("   - Predictive collision detection: ACTIVE")
+print("   - Intelligent sensor fusion: ACTIVE")
+print("   - Lead TTC closing-speed refinement: ACTIVE")
+print("   - Heading hold on avoidance clear: ACTIVE")
+print("   - Pressure based on closest edge distance: ACTIVE")
+print(string.format("   - Debug output: %s", CONFIG.DEBUG_PRINT and "ENABLED" or "DISABLED"))
