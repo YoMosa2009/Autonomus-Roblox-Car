@@ -1,8 +1,6 @@
 -- AUTONOMOUS VEHICLE CONTROLLER V4 - SECTOR AVOIDANCE (REVAMPED)
 -- Multi-stage threat assessment with predictive collision detection
 -- Intelligent sensor fusion for smooth, accurate autonomous driving
---
--- Changes applied (per your request):
 -- 1) Forward velocity sign fix (no abs on dot; clamp to >= 0)
 -- 2) Lead vehicle TTC improvement using lead distance delta (closing speed)
 -- 3) Heading hold now activates when avoidance completes (and after pedestrian clear)
