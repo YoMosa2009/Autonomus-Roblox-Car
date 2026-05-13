@@ -1,15 +1,29 @@
+-- ============================================================================
 -- AUTONOMOUS VEHICLE CONTROLLER V4 - SECTOR AVOIDANCE (REVAMPED)
+-- ============================================================================
 -- Multi-stage threat assessment with predictive collision detection
 -- Intelligent sensor fusion for smooth, accurate autonomous driving
--- 1) Forward velocity sign fix (no abs on dot; clamp to >= 0)
--- 2) Lead vehicle TTC improvement using lead distance delta (closing speed)
--- 3) Heading hold now activates when avoidance completes (and after pedestrian clear)
--- 4) Lane pressure now uses closest-distance-to-edge, not lane ray counts
--- 5) Obstacle avoidance replaced with sector-based free-space selection (windowed beams + hysteresis latch)
--- 6) Fusion updated so lane assist is guidance and cannot override avoidance in conflict cases
--- 7) Straight vs curve tuning: adaptive lane smoothing and speed scaling based on yaw rate and lane demand
--- 8) Added STEER_SIGN config for steering calibration (flip if avoidance turns the wrong way)
 --
+-- FEATURES:
+--   • Lane keeping with dual ray sensors (SensorL, SensorR)
+--   • Obstacle avoidance with LIDAR sector selection (SensorC)
+--   • Multi-stage threat assessment (5 levels: NONE -> CRITICAL)
+--   • Pedestrian detection with yield/avoid behavior
+--   • Intelligent fusion balancing lane guidance and collision avoidance
+--   • Heading hold for post-maneuver stabilization
+--   • Dynamic speed scaling based on threats and curvature
+--   • Real-time visual feedback system (colored beams)
+--
+-- RECENT IMPROVEMENTS (V4):
+--   1) Forward velocity sign fix (no abs on dot; clamp to >= 0)
+--   2) Lead vehicle TTC improvement using lead distance delta (closing speed)
+--   3) Heading hold now activates when avoidance completes (and after pedestrian clear)
+--   4) Lane pressure now uses closest-distance-to-edge, not lane ray counts
+--   5) Obstacle avoidance replaced with sector-based free-space selection (windowed beams + hysteresis latch)
+--   6) Fusion updated so lane assist is guidance and cannot override avoidance in conflict cases
+--   7) Straight vs curve tuning: adaptive lane smoothing and speed scaling based on yaw rate and lane demand
+--   8) Added STEER_SIGN config for steering calibration (flip if avoidance turns the wrong way)
+-- ============================================================================
 
 
 local RunService = game:GetService("RunService")
@@ -93,7 +107,6 @@ local CONFIG = {
 	HEADING_DECAY = true,
 }
 
-	-- Visuals
 -- =========================
 -- SEMANTIC DATABASE
 -- =========================
