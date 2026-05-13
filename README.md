@@ -135,3 +135,15 @@ Set `CONFIG.DEBUG_PRINT = true` for real-time state information:
 - Avoidance session start/complete
 - Threat levels and distances
 - Lead vehicle tracking data
+
+## Available Versions
+
+This repository contains multiple script versions:
+
+| Version | File | Focus | Status |
+|---------|------|-------|--------|
+| **V6** | `Roblox Autonomous Car - V6` | Advanced with planning architecture, route hooks, slow-zone hooks | Latest features |
+| **V4** | `RobloxCarAutonomusV4.txt` | Sector avoidance, multi-stage threat assessment, pedestrian behavior | Well-tested |
+| **Stable** | `Script \| Stable Version` | Fundamental pedest tracking, lane fusion, semantic awareness | Baseline |
+
+Choose the version that best fits your use case. V4 is recommended for production use with mature obstacle avoidance behavior.
